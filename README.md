@@ -1,22 +1,16 @@
-# Kids Mode for Onion OS
+# Kids Mode Parent Plus for Onion OS
+DO NOT DOWNLOAD YET. NOT ALL MODES IMPLEMENTED YET
+Most of this README is the same as Veuks'. I will reupload a new one when I am finished testing and uploading
+This is a placeholder description for an update on the Onion Kids mode by Daverad based on the fork by Veuks. This is being tested on a Miyoo Mini Flip
 
-Kids Mode combines games, videos and audio in one simple, protected launcher
-for the Miyoo Mini and Miyoo Mini Plus. It is designed for young children:
-large artwork, a small set of useful controls, automatic resume, an optional
-session timer, and a PIN-protected parent menu.
-
-The existing `v1.0.0` release remains published under the former **Kids Mode
-Deluxe** name. Its install archive is still named `KidsMode-Deluxe.zip`.
-The current source and all future builds use the Kids Mode name and
-folders. Kids Mode is treated as a separate, clean installation; no
-settings or playback state are imported automatically from the former app.
-
-Games stay on the lower section and videos stay on the upper section. The two
-sections use the active Onion theme and slide smoothly between each other.
+Disclaimer: I have learned qBasic and Visual Basic in High school 25 years ago and C++, JavaScript, and Ruby in college 20 years ago and haven't done much besides teaching my middle school students Code.org and 
+picking up some HTML5 here and there. Because of this, I used Claude Sonnet 5.5 almost exclusively in the development of this project.
+I did go into the code here and there and checked some things as I know enough to do basic troubleshooting, but frequent testing followed by prompting to the AI was the majority of my debugging.
 
 ## Highlights
 
-- One protected app for favorite games, children's videos and audio.
+The following were included in the Veuks fork as well as the original Daverad kids mode
+- One protected app for favorite games, children's videos and audio. *I don't use the video/audio mode at all so this remains untested
 - Games are taken directly from Onion's Favorites list.
 - Videos, audio files and nested folders for movies, series, music or stories
   are supported.
@@ -25,7 +19,7 @@ sections use the active Onion theme and slide smoothly between each other.
   - shut down from a carousel and the same section and selection return;
   - switching between Games and Videos restores the last selection on each.
 - Video progress is saved regularly and completed videos restart from the
-  beginning the next time they are opened.
+  beginning the next time they are opened. *Untested
 - Every folder level reopens on its own last selected item.
 - Optional shared session timer from 5 to 120 minutes, or no timer.
 - PIN-protected parent menu with extra time, timer removal, exit, and a
@@ -34,22 +28,29 @@ sections use the active Onion theme and slide smoothly between each other.
 - ScreenScraper Mix V1-inspired reflection on video artwork for visual
   consistency with game thumbnails.
 - Separate child save profile for games; the parent's saves and states are
-  restored when leaving the mode.
+  restored when leaving the mode. *Untested as this device is only for my child
+
+  Parents+ additions:
+  -Daily time limit automatically set (weekday/weekend)
+  -Only need to enter the PIN once when time is up (original fork turned timer off and then required second input to create new timer or add time)
+  -Designated play window (default 4PM - 7PM on weekdays and 8AM - 7PM on weekends) to lock the child out when they shouldn't be playing
+  -A bypass button to allow for unlimited play when on vacation or for special circumstances
+  -A blinking warning when at 30 seconds left. This is specifically because my child needs it. It can be disabled in the .sh file
+  -Rewind and save states turned on (must first be enabled in the retroarch cores
+  -Rentals. This is an optional system that allows the child to rent a game for a period. When the rental is up, it gets removed from the favorites list
+  *The rental option goes with a storefront I created where my child can earn money towards purchasing or renting games
 
 ## Requirements
 
-- Miyoo Mini or Miyoo Mini Plus.
-- Onion OS 4.3 or newer.
-- Games and media are optional. Kids Mode can start with an empty library;
-  add games to Onion's Favorites and/or media files if you want them to appear.
-- Onion's FFplay binary, included with normal Onion installations.
+- Miyoo Mini, Miyoo Mini Plus, or Miyoo Mini Flip
+- Onion OS 4.3 or newer
+- Onion's FFplay binary, included with normal Onion installations
 
-The current version was tested on real Miyoo Mini Plus hardware. Mini and Mini
-V4 display sizes are supported in the code, but feedback is welcome.
+The current version was tested on real Miyoo Mini Flip hardware
 
 ## Installation
 
-1. Download `Kids-Mode.zip` from a Kids Mode release, or use the
+1. Download `Kids-Mode-parent-plus.zip` from a Kids Mode release, or use the
    `Kids-Mode-build` artifact while testing the current source. The
    historical `v1.0.0` release remains available as `KidsMode-Deluxe.zip`.
 2. Extract the ZIP.
