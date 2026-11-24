@@ -1,16 +1,22 @@
-# Kids Mode Parent Plus for Onion OS
-DO NOT DOWNLOAD YET. NOT ALL MODES IMPLEMENTED YET
-Most of this README is the same as Veuks'. I will reupload a new one when I am finished testing and uploading
-This is a placeholder description for an update on the Onion Kids mode by Daverad based on the fork by Veuks. This is being tested on a Miyoo Mini Flip
+# Kids Mode for Onion OS
 
-Disclaimer: I have learned qBasic and Visual Basic in High school 25 years ago and C++, JavaScript, and Ruby in college 20 years ago and haven't done much besides teaching my middle school students Code.org and 
-picking up some HTML5 here and there. Because of this, I used Claude Sonnet 5.5 almost exclusively in the development of this project.
-I did go into the code here and there and checked some things as I know enough to do basic troubleshooting, but frequent testing followed by prompting to the AI was the majority of my debugging.
+Kids Mode combines games, videos and audio in one simple, protected launcher
+for the Miyoo Mini and Miyoo Mini Plus. It is designed for young children:
+large artwork, a small set of useful controls, automatic resume, an optional
+session timer, and a PIN-protected parent menu.
+
+The existing `v1.0.0` release remains published under the former **Kids Mode
+Deluxe** name. Its install archive is still named `KidsMode-Deluxe.zip`.
+The current source and all future builds use the Kids Mode name and
+folders. Kids Mode is treated as a separate, clean installation; no
+settings or playback state are imported automatically from the former app.
+
+Games stay on the lower section and videos stay on the upper section. The two
+sections use the active Onion theme and slide smoothly between each other.
 
 ## Highlights
 
-The following were included in the Veuks fork as well as the original Daverad kids mode
-- One protected app for favorite games, children's videos and audio. *I don't use the video/audio mode at all so this remains untested
+- One protected app for favorite games, children's videos and audio.
 - Games are taken directly from Onion's Favorites list.
 - Videos, audio files and nested folders for movies, series, music or stories
   are supported.
@@ -19,7 +25,7 @@ The following were included in the Veuks fork as well as the original Daverad ki
   - shut down from a carousel and the same section and selection return;
   - switching between Games and Videos restores the last selection on each.
 - Video progress is saved regularly and completed videos restart from the
-  beginning the next time they are opened. *Untested
+  beginning the next time they are opened.
 - Every folder level reopens on its own last selected item.
 - Optional shared session timer from 5 to 120 minutes, or no timer.
 - PIN-protected parent menu with extra time, timer removal, exit, and a
@@ -28,29 +34,22 @@ The following were included in the Veuks fork as well as the original Daverad ki
 - ScreenScraper Mix V1-inspired reflection on video artwork for visual
   consistency with game thumbnails.
 - Separate child save profile for games; the parent's saves and states are
-  restored when leaving the mode. *Untested as this device is only for my child
-
-  Parents+ additions:
-  -Daily time limit automatically set (weekday/weekend)
-  -Only need to enter the PIN once when time is up (original fork turned timer off and then required second input to create new timer or add time)
-  -Designated play window (default 4PM - 7PM on weekdays and 8AM - 7PM on weekends) to lock the child out when they shouldn't be playing
-  -A bypass button to allow for unlimited play when on vacation or for special circumstances
-  -A blinking warning when at 30 seconds left. This is specifically because my child needs it. It can be disabled in the .sh file
-  -Rewind and save states turned on (must first be enabled in the retroarch cores
-  -Rentals. This is an optional system that allows the child to rent a game for a period. When the rental is up, it gets removed from the favorites list
-  *The rental option goes with a storefront I created where my child can earn money towards purchasing or renting games
+  restored when leaving the mode.
 
 ## Requirements
 
-- Miyoo Mini, Miyoo Mini Plus, or Miyoo Mini Flip
-- Onion OS 4.3 or newer
-- Onion's FFplay binary, included with normal Onion installations
+- Miyoo Mini or Miyoo Mini Plus.
+- Onion OS 4.3 or newer.
+- Games and media are optional. Kids Mode can start with an empty library;
+  add games to Onion's Favorites and/or media files if you want them to appear.
+- Onion's FFplay binary, included with normal Onion installations.
 
-The current version was tested on real Miyoo Mini Flip hardware
+The current version was tested on real Miyoo Mini Plus hardware. Mini and Mini
+V4 display sizes are supported in the code, but feedback is welcome.
 
 ## Installation
 
-1. Download `Kids-Mode-parent-plus.zip` from a Kids Mode release, or use the
+1. Download `Kids-Mode.zip` from a Kids Mode release, or use the
    `Kids-Mode-build` artifact while testing the current source. The
    historical `v1.0.0` release remains available as `KidsMode-Deluxe.zip`.
 2. Extract the ZIP.
@@ -312,6 +311,22 @@ docker run --rm -v "$PWD/Onion":/root/workspace \
   aemiii91/miyoomini-toolchain:latest \
   /bin/bash -c "source /root/.bashrc; cd src/kidsMode && make"
 ```
+
+## Changes in this fork
+
+This fork adds family-schedule controls aimed at a games-only device. Everything below is new relative to the upstream project; the changes are shell-script edits plus a small addition to the parent menu in `src/kidsMode/videoui.c`.
+
+- **Daily play time that resets every midnight**, with separate **weekday** (default 30 min) and **weekend** (default 60 min) limits. Both can be changed from the parent menu (*Weekday daily limit*, *Weekend daily limit*; 5-120 min). They are stored in `Saves/KidsMode/schedule_minutes.txt` (lines 1-2).
+- **Play windows ("bedtime lock").** Outside the window the device shows *Time's up!* regardless of minutes left. Defaults: weekdays 4:00 pm-7:00 pm, weekends 8:00 am-7:00 pm. Change them from the parent menu (*Weekday play from/until*, *Weekend play from/until*, 15-minute steps; a start time that is not before the end time is rejected). They are stored in `Saves/KidsMode/schedule_minutes.txt` (lines 3-6, 24-hour `HHMM`). Check that the device clock keeps the time across a full power-off.
+- **Bypass ("vacation mode").** *Add play time* set to *Unlimited today* removes the daily limit and the play window for the rest of the day. Time added afterwards with *Add play time* then becomes the only limit (for example, 20 minutes in the car). The bypass ends at midnight, or when Kids Mode is re-armed. For a trip, write the last day (`YYYYMMDD`, for example `20261226`) into `Saves/KidsMode/bypass_until`.
+- **One PIN at "Time's up".** The PIN entered on the *Time's up!* screen opens the parent menu directly.
+- **Blinking warning** ("NN sec left - save your game!") during the last 30 seconds of a game. It is drawn with RetroArch's on-screen message line, so it alternates wording rather than truly flashing.
+- **Rewind allowed in games.** The original rewind hotkey is restored while the lock is active. Rewind itself must still be enabled per core in RetroArch.
+- **Game rentals.** *Rent current game* (parent menu) removes the highlighted game from Onion's Favorites after 1-14 days (0 cancels). Rentals live in `Saves/KidsMode/rentals.txt` as `<expiry epoch>|<rompath>`; a hand-written `<days>|<rompath>` line is also accepted. Only the Favorites entry is removed: the ROM and the child's saves are untouched, so adding the game back to Favorites restores it with its progress.
+
+Notes: the *Play timer* picker on the start screen is no longer used (limits come from the schedule above). Time added with *Add play time* does not extend the play window; use *Unlimited today* for that. The status line in the parent menu now appears in the header ("Parent Menu - N min left").
+
+These changes were developed with AI assistance (Claude). They were checked by running the schedule and rental logic against a simulated clock, but the menu changes were not compiled or tested on hardware by the author of this note; please test on your device first.
 
 ## Credits
 

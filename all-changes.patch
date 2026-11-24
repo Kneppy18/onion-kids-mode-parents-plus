@@ -1,0 +1,827 @@
+diff --git a/App/KidsMode/kid_mode_loop.sh b/App/KidsMode/kid_mode_loop.sh
+index 77c966b..ee87268 100644
+--- a/App/KidsMode/kid_mode_loop.sh
++++ b/App/KidsMode/kid_mode_loop.sh
+@@ -151,6 +151,151 @@ mkdir -p "$backupdir" "$profile_state_dir" "$positions" \
+     "$folder_selections_dir" "$artwork_cache_dir" "$videosdir/Imgs"
+ timer_state_date="$(date +%Y-%m-%d)"
+ 
++# ---------------- Daily schedule (weekday / weekend) ------------------------
++# Everything here is changed from the parent menu and stored in
++# schedule_minutes.txt on the SD card (6 lines: weekday minutes, weekend
++# minutes, weekday window start, weekday window end, weekend window start,
++# weekend window end; times are 24-hour HHMM). The defaults below apply until
++# the parent changes them.
++DEFAULT_WEEKDAY_MINUTES=30
++DEFAULT_WEEKEND_MINUTES=60
++DEFAULT_WEEKDAY_PLAY_START=1600   # Mon-Fri: playable 4:00 pm ...
++DEFAULT_WEEKDAY_PLAY_END=1900     # ... until 7:00 pm
++DEFAULT_WEEKEND_PLAY_START=0800   # Sat-Sun: playable 8:00 am ...
++DEFAULT_WEEKEND_PLAY_END=1900     # ... until 7:00 pm
++schedule_file="$backupdir/schedule_minutes.txt"
++bypass_file="$backupdir/bypass_until"           # last bypass day, YYYYMMDD
++rentals_file="$backupdir/rentals.txt"           # "<expiry epoch>|<rompath>"
++
++schedule_default() { # $1 = line number 1..6
++    case "$1" in
++        1) echo "$DEFAULT_WEEKDAY_MINUTES" ;;
++        2) echo "$DEFAULT_WEEKEND_MINUTES" ;;
++        3) echo "$DEFAULT_WEEKDAY_PLAY_START" ;;
++        4) echo "$DEFAULT_WEEKDAY_PLAY_END" ;;
++        5) echo "$DEFAULT_WEEKEND_PLAY_START" ;;
++        6) echo "$DEFAULT_WEEKEND_PLAY_END" ;;
++    esac
++}
++
++# Value of line $1 of the schedule file, or its default when missing/invalid.
++schedule_get() {
++    g_v=""
++    [ -f "$schedule_file" ] &&
++        g_v="$(sed -n "${1}p" "$schedule_file" 2> /dev/null | tr -d '\r')"
++    case "$1" in
++        1 | 2) case "$g_v" in '' | *[!0-9]* | 0) g_v="" ;; esac ;;
++        *) case "$g_v" in [0-2][0-9][0-5][0-9]) ;; *) g_v="" ;; esac ;;
++    esac
++    [ -n "$g_v" ] || g_v="$(schedule_default "$1")"
++    echo "$g_v"
++}
++
++# Set line $1 to value $2, keeping the other five values.
++schedule_set() {
++    ss_1="$(schedule_get 1)"
++    ss_2="$(schedule_get 2)"
++    ss_3="$(schedule_get 3)"
++    ss_4="$(schedule_get 4)"
++    ss_5="$(schedule_get 5)"
++    ss_6="$(schedule_get 6)"
++    case "$1" in
++        1) ss_1="$2" ;;
++        2) ss_2="$2" ;;
++        3) ss_3="$2" ;;
++        4) ss_4="$2" ;;
++        5) ss_5="$2" ;;
++        6) ss_6="$2" ;;
++    esac
++    mkdir -p "$backupdir"
++    printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$ss_1" "$ss_2" "$ss_3" "$ss_4" \
++        "$ss_5" "$ss_6" > "$schedule_file.tmp" &&
++        mv -f "$schedule_file.tmp" "$schedule_file"
++}
++
++schedule_minutes() { # $1 = weekday | weekend
++    if [ "$1" = weekend ]; then schedule_get 2; else schedule_get 1; fi
++}
++
++# Bypass ("vacation mode"): active through the date stored in bypass_file.
++bypass_active() {
++    b=""
++    [ -f "$bypass_file" ] && IFS= read -r b < "$bypass_file"
++    case "$b" in '' | *[!0-9]*) return 1 ;; esac
++    [ "$b" -ge "$(date +%Y%m%d)" ]
++}
++
++hhmm_to_secs() { # $1 = HHMM
++    t_h="${1%??}"
++    t_m="${1#??}"
++    t_h="${t_h#0}"
++    t_m="${t_m#0}"
++    echo $((${t_h:-0} * 3600 + ${t_m:-0} * 60))
++}
++
++now_secs() {
++    n_h="$(date +%H)"
++    n_m="$(date +%M)"
++    n_s="$(date +%S)"
++    n_h="${n_h#0}"
++    n_m="${n_m#0}"
++    n_s="${n_s#0}"
++    echo $((${n_h:-0} * 3600 + ${n_m:-0} * 60 + ${n_s:-0}))
++}
++
++# Seconds until today's play window closes; 0 when outside the window.
++# During a bypass the window does not apply.
++schedule_window_left() {
++    bypass_active && {
++        echo 999999
++        return 0
++    }
++    if [ "$(date +%u)" -le 5 ]; then
++        w_start="$(schedule_get 3)"
++        w_end="$(schedule_get 4)"
++    else
++        w_start="$(schedule_get 5)"
++        w_end="$(schedule_get 6)"
++    fi
++    w_now="$(now_secs)"
++    w_s="$(hhmm_to_secs "$w_start")"
++    w_e="$(hhmm_to_secs "$w_end")"
++    if [ "$w_now" -lt "$w_s" ] || [ "$w_now" -ge "$w_e" ]; then
++        echo 0
++    else
++        echo $((w_e - w_now))
++    fi
++}
++
++# Today's total budget in seconds (daily minutes + bonus added today).
++# During a bypass only hand-added bonus time counts; 0 means unlimited.
++effective_budget() {
++    if bypass_active; then
++        echo "$(state_bonus)"
++        return 0
++    fi
++    if [ "$(date +%u)" -le 5 ]; then
++        echo $(($(schedule_minutes weekday) * 60 + $(state_bonus)))
++    else
++        echo $(($(schedule_minutes weekend) * 60 + $(state_bonus)))
++    fi
++}
++
++# New calendar day: wipe used time and bonus.
++daily_rollover() {
++    d_today="$(date +%Y-%m-%d)"
++    d_disk=""
++    [ -f "$timer_state" ] && IFS= read -r d_disk < "$timer_state"
++    [ "$d_disk" = "$d_today" ] && return 0
++    printf '0\n' > "$timer_runtime_used.rollover" &&
++        mv -f "$timer_runtime_used.rollover" "$timer_runtime_used"
++    mkdir -p "$backupdir"
++    printf '%s\n0\n0\n' "$d_today" > "$timer_state.tmp" &&
++        mv -f "$timer_state.tmp" "$timer_state"
++    rm -f "$timesup_since_file" "$timesup_resume_file" "$timesup_resume_file.tmp"
++    log "New day: daily play time reset."
++}
++
+ cfg_pin_hash=""
+ cfg_pin_salt=""
+ cfg_pin_plain=""
+@@ -678,6 +823,16 @@ AWKEOF
+     } > "$awkprog"
+ 
+     awk -f "$awkprog" "$racfg" > "$tmpra" && mv -f "$tmpra" "$racfg"
++
++    # Rewind stays available: put back the original rewind hotkey from the
++    # untouched backup (rewind itself must be enabled per core in RetroArch).
++    orig_rewind="$(grep -E '^[[:space:]]*input_rewind_btn[[:space:]]*=' \
++        "$rabackup" 2> /dev/null | tail -n 1)"
++    if [ -n "$orig_rewind" ]; then
++        grep -vE '^[[:space:]]*input_rewind_btn[[:space:]]*=' "$racfg" > "$tmpra" &&
++            printf '%s\n' "$orig_rewind" >> "$tmpra" &&
++            mv -f "$tmpra" "$racfg"
++    fi
+     rm -f "$awkprog"
+     log "RetroArch kiosk lock applied (direct-key lookup, duplicates locked)."
+ }
+@@ -1020,14 +1175,14 @@ state_persist() { # $1 used, $2 bonus
+             IFS= read -r timer_disk_used
+             IFS= read -r timer_disk_bonus
+         } < "$timer_state"
+-        if [ "$timer_disk_day" = "$timer_state_date" ] &&
++        if [ "$timer_disk_day" = "$(date +%Y-%m-%d)" ] &&
+             [ "$timer_disk_used" = "$1" ] &&
+             [ "$timer_disk_bonus" = "$2" ]; then
+             return 0
+         fi
+     fi
+     mkdir -p "$backupdir"
+-    printf '%s\n%s\n%s\n' "$timer_state_date" "$1" "$2" > "$timer_state.tmp" &&
++    printf '%s\n%s\n%s\n' "$(date +%Y-%m-%d)" "$1" "$2" > "$timer_state.tmp" &&
+         mv -f "$timer_state.tmp" "$timer_state"
+ }
+ 
+@@ -1038,22 +1193,26 @@ state_write() { # $1 used, $2 bonus
+ }
+ 
+ checkpoint_timer_state() {
++    daily_rollover
+     [ -f "$timer_runtime_used" ] || return 0
+     state_persist "$(state_used)" "$(state_bonus)"
+ }
+ 
+ # Recompute and publish remaining seconds right now (clamped to >= 0;
+ # file absent = timer off). Called by the ticker and after menu changes.
+-# NB: the budget is per SESSION (set at arm / extended via Add play time);
+-# there is no daily reset — a new arm starts a fresh budget.
++# The budget is per DAY (weekday/weekend minutes + bonus) and is further
++# limited by the play window; both reset/apply automatically.
+ update_remaining_now() {
+-    budget=$(($(get_timer_minutes) * 60 + $(state_bonus)))
++    daily_rollover
++    budget="$(effective_budget)"
+     if [ "$budget" -le 0 ]; then
+         rm -f "$remaining_file" "$timesup_since_file"
+         return 0
+     fi
+     rem=$((budget - $(state_used)))
+     [ "$rem" -lt 0 ] && rem=0
++    wl="$(schedule_window_left)"
++    [ "$wl" -lt "$rem" ] && rem="$wl"
+     echo "$rem" > "$remaining_file"
+     if [ "$rem" -eq 0 ]; then
+         if [ ! -f "$timesup_since_file" ]; then
+@@ -1111,6 +1270,19 @@ pin_message() {
+     ) &
+ }
+ 
++# Blinking last-30-seconds warning: RetroArch's OSD cannot flash, so alternate
++# two wordings once a second for 10 s (one ticker interval).
++flash_message() {
++    (
++        for _i in 1 2 3 4 5; do
++            sendUDP "SHOW_MSG $1" > /dev/null 2>&1
++            sleep 1
++            sendUDP "SHOW_MSG !! $1 !!" > /dev/null 2>&1
++            sleep 1
++        done
++    ) &
++}
++
+ game_is_running() {
+     pgrep -f "cmd_to_run.sh" > /dev/null 2>&1 ||
+         { [ -f "$player_pid" ] && kill -0 "$(cat "$player_pid")" 2> /dev/null; }
+@@ -1165,7 +1337,8 @@ ticker_loop() {
+         [ -f "$flagfile" ] || break
+         [ -f /tmp/shutting_down ] && break
+ 
+-        budget=$(($(get_timer_minutes) * 60 + $(state_bonus)))
++        daily_rollover
++        budget="$(effective_budget)"
+         if [ "$budget" -le 0 ]; then
+             rm -f "$remaining_file" "$timesup_since_file"
+             continue
+@@ -1191,6 +1364,8 @@ ticker_loop() {
+         fi
+         rem=$((budget - used))
+         [ "$rem" -lt 0 ] && rem=0
++        wl="$(schedule_window_left)"
++        [ "$wl" -lt "$rem" ] && rem="$wl"
+         echo "$rem" > "$remaining_file"
+         if [ "$rem" -eq 0 ]; then
+             if [ ! -f "$timesup_since_file" ]; then
+@@ -1216,7 +1391,10 @@ ticker_loop() {
+             # coordinates — rotated 180° from the viewed image — so they
+             # only produce a brief flipped flash. Not used during games.)
+             if [ "$rem" -gt 0 ]; then
+-                if [ "$rem_min" -le 5 ]; then
++                if [ "$rem" -le 30 ]; then
++                    # Last 30 seconds: blinking warning
++                    flash_message "$rem sec left - save your game!"
++                elif [ "$rem_min" -le 5 ]; then
+                     # Last 5 minutes: countdown stays pinned on screen
+                     pin_message "$rem_min min"
+                 elif [ "$rem_min" != "$last_notified_min" ] &&
+@@ -1621,6 +1799,75 @@ remove_fav_shortcut() {
+     fi
+ }
+ 
++# ------------------------------ game rentals --------------------------------
++# rentals.txt holds one "<expiry epoch>|<rompath>" line per rented game. When
++# the expiry passes, the game is removed from Onion's Favorites (so Kids Mode
++# no longer lists it). The ROM and the child's saves are not touched; adding
++# the game back to Favorites restores it with its progress. A line may also be
++# written by hand as "<days>|<rompath>" (days < 100000); it is stamped with its
++# expiry time the first time it is seen.
++
++# Parent menu: rent the highlighted game for $1 days (0 = cancel the rental).
++set_game_rental() {
++    rent_days="$1"
++    case "$rent_days" in '' | *[!0-9]*) return 0 ;; esac
++    rent_path="$(sed -n 1p "$game_selection_file" 2> /dev/null)"
++    rent_label=""
++    if [ -n "$rent_path" ] && [ -f "$favfile" ]; then
++        rent_label="$(jq -r --arg p "$rent_path" \
++            'select(.rompath == $p) | .label' "$favfile" 2> /dev/null | head -n 1)"
++    fi
++    if [ -z "$rent_label" ]; then
++        infoPanel -t "Rentals" -m "Highlight a game in the\ncarousel first." --auto
++        log "Rental request ignored; no matching favorite for: $rent_path"
++        return 0
++    fi
++    mkdir -p "$backupdir"
++    tmp_rentals="$rentals_file.tmp.$$"
++    : > "$tmp_rentals"
++    if [ -f "$rentals_file" ]; then
++        # Drop any earlier rental line for this same game
++        awk -F'|' -v p="$rent_path" '
++            { i = index($0, "|"); if (substr($0, i + 1) != p) print }
++        ' "$rentals_file" > "$tmp_rentals"
++    fi
++    if [ "$rent_days" -gt 0 ]; then
++        printf '%s|%s\n' "$(($(date +%s) + rent_days * 86400))" "$rent_path" \
++            >> "$tmp_rentals"
++        mv -f "$tmp_rentals" "$rentals_file"
++        log "Rental set: $rent_label for $rent_days day(s)."
++        infoPanel -t "Rentals" -m "$rent_label\nrented for $rent_days day(s)." --auto
++    else
++        mv -f "$tmp_rentals" "$rentals_file"
++        log "Rental canceled: $rent_label"
++        infoPanel -t "Rentals" -m "$rent_label\nrental canceled." --auto
++    fi
++}
++
++expire_rentals() {
++    [ -f "$rentals_file" ] || return 0
++    now="$(date +%s)"
++    out="$rentals_file.tmp.$$"
++    : > "$out"
++    cr="$(printf '\r')"
++    while IFS='|' read -r when rpath || [ -n "$when" ]; do
++        rpath="${rpath%$cr}"
++        [ -n "$when" ] && [ -n "$rpath" ] || continue
++        case "$when" in *[!0-9]*) continue ;; esac
++        [ "$when" -lt 100000 ] && when=$((now + when * 86400))
++        if [ "$now" -ge "$when" ] && [ -f "$favfile" ] &&
++            jq -c --arg p "$rpath" 'select(.rompath != $p)' \
++                "$favfile" > "$favfile.tmp.$$" 2> /dev/null &&
++            mv -f "$favfile.tmp.$$" "$favfile"; then
++            log "Rental expired; removed from favorites: $rpath"
++        else
++            rm -f "$favfile.tmp.$$"
++            printf '%s|%s\n' "$when" "$rpath" >> "$out"
++        fi
++    done < "$rentals_file"
++    mv -f "$out" "$rentals_file"
++}
++
+ ensure_fav_shortcut() {
+     repair_favourites
+ 
+@@ -1900,6 +2147,12 @@ parent_menu() {
+             --floor "$menu_floor" \
+             --lock-floor "$lock_val" \
+             --allow-save-states "$states_val" \
++            --weekday-min "$(schedule_minutes weekday)" \
++            --weekend-min "$(schedule_minutes weekend)" \
++            --wd-start "$(schedule_get 3)" \
++            --wd-end "$(schedule_get 4)" \
++            --we-start "$(schedule_get 5)" \
++            --we-end "$(schedule_get 6)" \
+             --switch-profile "$switch_profile_arg" \
+             --show-stories "$show_stories_value" \
+             --show-movies "$show_movies_value" \
+@@ -1994,17 +2247,17 @@ parent_menu() {
+                 return 0
+                 ;;
+             NOTIMER)
+-                # Turn the play timer off entirely: clear the configured
+-                # minutes AND any bonus, so nothing keeps a budget alive.
+-                # The kid can play with no limit until re-armed or time is
+-                # added again.
++                # Bypass ("vacation mode") for the rest of today: no daily
++                # limit and no play window. Time added afterwards with "Add
++                # play time" becomes the only limit. Ends at midnight, or
++                # when Kids Mode is re-armed.
+                 stop_ticker
+-                set_timer_minutes 0
+                 state_write 0 0
++                printf '%s\n' "$(date +%Y%m%d)" > "$bypass_file"
+                 update_remaining_now
+                 start_ticker
+                 rm -f "$timesup_resume_file" "$timesup_resume_file.tmp"
+-                log "Play timer turned off from the parent menu."
++                log "Time limits bypassed for today from the parent menu."
+                 continue
+                 ;;
+             ADDTIME)
+@@ -2034,6 +2287,51 @@ parent_menu() {
+                         ;;
+                 esac
+                 ;;
++            SETWEEKDAY | SETWEEKEND)
++                case "$menu_arg" in '' | *[!0-9]* | 0) continue ;; esac
++                [ "$menu_arg" -gt 120 ] && menu_arg=120
++                if [ "$menu_action" = SETWEEKDAY ]; then
++                    schedule_set 1 "$menu_arg"
++                else
++                    schedule_set 2 "$menu_arg"
++                fi
++                update_remaining_now
++                log "Daily play time set: weekday $(schedule_get 1) min, weekend $(schedule_get 2) min."
++                continue
++                ;;
++            SETWDSTART | SETWDEND | SETWESTART | SETWEEND)
++                case "$menu_arg" in
++                    [0-2][0-9][0-5][0-9]) ;;
++                    *) continue ;;
++                esac
++                case "$menu_action" in
++                    SETWDSTART) win_idx=3; win_pair=4 ;;
++                    SETWDEND) win_idx=4; win_pair=3 ;;
++                    SETWESTART) win_idx=5; win_pair=6 ;;
++                    SETWEEND) win_idx=6; win_pair=5 ;;
++                esac
++                win_other="$(schedule_get "$win_pair")"
++                if [ "$win_idx" = 3 ] || [ "$win_idx" = 5 ]; then
++                    new_ws="$menu_arg"
++                    new_we="$win_other"
++                else
++                    new_ws="$win_other"
++                    new_we="$menu_arg"
++                fi
++                if [ "$(hhmm_to_secs "$new_ws")" -ge "$(hhmm_to_secs "$new_we")" ]; then
++                    infoPanel -t "Play window" -m "The start time must be\nbefore the end time." --auto
++                    log "Play window change rejected: $new_ws-$new_we."
++                    continue
++                fi
++                schedule_set "$win_idx" "$menu_arg"
++                update_remaining_now
++                log "Play window set: weekday $(schedule_get 3)-$(schedule_get 4), weekend $(schedule_get 5)-$(schedule_get 6)."
++                continue
++                ;;
++            RENTAL)
++                set_game_rental "$menu_arg"
++                continue
++                ;;
+             SWITCHPROFILE)
+                 case "$menu_arg" in
+                     Main | Guest)
+@@ -2557,33 +2855,14 @@ play_video() {
+ }
+ 
+ disable_timer_and_resume_timesup() {
+-    resume_kind=""
+-    [ -f "$timesup_resume_file" ] &&
+-        resume_kind="$(sed -n 1p "$timesup_resume_file" 2> /dev/null)"
++    # The PIN entered on the "Time's up" screen opens the parent menu directly
++    # (no second PIN). Nothing is reset here: add time or use "Turn off timer"
++    # from the menu.
+     rm -f "$timesup_resume_file" "$timesup_resume_file.tmp" \
+         "$timesup_since_file"
+-
+-    # Stop the zero-budget ticker before changing both persistent values, then
+-    # restart it in timer-off mode so a later parent-menu change still works.
+-    stop_ticker
+-    set_timer_minutes 0
+-    state_write 0 0
+     update_remaining_now
+-    start_ticker
+-    log "Time's-up PIN accepted; timer disabled; returning to $resume_kind."
+-
+-    case "$resume_kind" in
+-        parent)
+-            # Reopen the authenticated parent menu once, without asking for
+-            # a second PIN. The main loop consumes this in its next pass.
+-            reopen_parent_menu_requested=1
+-            ;;
+-        *)
+-            # Media and games both return to their saved carousel selection.
+-            # Old "video"/"game" markers from an earlier build deliberately
+-            # fall through here too, so updating cannot relaunch content.
+-            ;;
+-    esac
++    log "Time's-up PIN accepted; opening the parent menu."
++    reopen_parent_menu_requested=1
+ }
+ 
+ cmd_run() {
+@@ -2684,6 +2963,7 @@ cmd_run() {
+ 
+     while [ -f "$flagfile" ]; do
+         check_off_order "End"
++        expire_rentals
+ 
+         if [ "$reopen_parent_menu_requested" = 1 ]; then
+             reopen_parent_menu_requested=0
+@@ -2982,8 +3262,13 @@ cmd_arm() {
+             return 1
+         fi
+     fi
+-    set_timer_minutes "$profile_timer_choice"
+-    state_write 0 0
++    # Daily budget: re-arming on the same day keeps the time already used.
++    # Leaving bypass starts today's counters fresh.
++    if bypass_active; then
++        state_write 0 0
++    fi
++    rm -f "$bypass_file"
++    daily_rollover
+     update_remaining_now
+     rm -f "$timesup_resume_file" "$timesup_resume_file.tmp" \
+         "$parent_menu_active_file"
+@@ -2996,7 +3281,7 @@ cmd_arm() {
+     touch "$flagfile"
+     # Flush writes after launch without holding the timer screen on display.
+     (sleep 2; sync) &
+-    log "Kids Mode armed (timer: $(get_timer_minutes) min)."
++    log "Kids Mode armed (weekday $(schedule_minutes weekday) min, weekend $(schedule_minutes weekend) min per day)."
+ 
+     cmd_run
+ }
+diff --git a/README.md b/README.md
+index 7726490..c382428 100644
+--- a/README.md
++++ b/README.md
+@@ -312,6 +312,22 @@ docker run --rm -v "$PWD/Onion":/root/workspace \
+   /bin/bash -c "source /root/.bashrc; cd src/kidsMode && make"
+ ```
+ 
++## Changes in this fork
++
++This fork adds family-schedule controls aimed at a games-only device. Everything below is new relative to the upstream project; the changes are shell-script edits plus a small addition to the parent menu in `src/kidsMode/videoui.c`.
++
++- **Daily play time that resets every midnight**, with separate **weekday** (default 30 min) and **weekend** (default 60 min) limits. Both can be changed from the parent menu (*Weekday daily limit*, *Weekend daily limit*; 5-120 min). They are stored in `Saves/KidsMode/schedule_minutes.txt` (lines 1-2).
++- **Play windows ("bedtime lock").** Outside the window the device shows *Time's up!* regardless of minutes left. Defaults: weekdays 4:00 pm-7:00 pm, weekends 8:00 am-7:00 pm. Change them from the parent menu (*Weekday play from/until*, *Weekend play from/until*, 15-minute steps; a start time that is not before the end time is rejected). They are stored in `Saves/KidsMode/schedule_minutes.txt` (lines 3-6, 24-hour `HHMM`). Check that the device clock keeps the time across a full power-off.
++- **Bypass ("vacation mode").** *Add play time* set to *Unlimited today* removes the daily limit and the play window for the rest of the day. Time added afterwards with *Add play time* then becomes the only limit (for example, 20 minutes in the car). The bypass ends at midnight, or when Kids Mode is re-armed. For a trip, write the last day (`YYYYMMDD`, for example `20261226`) into `Saves/KidsMode/bypass_until`.
++- **One PIN at "Time's up".** The PIN entered on the *Time's up!* screen opens the parent menu directly.
++- **Blinking warning** ("NN sec left - save your game!") during the last 30 seconds of a game. It is drawn with RetroArch's on-screen message line, so it alternates wording rather than truly flashing.
++- **Rewind allowed in games.** The original rewind hotkey is restored while the lock is active. Rewind itself must still be enabled per core in RetroArch.
++- **Game rentals.** *Rent current game* (parent menu) removes the highlighted game from Onion's Favorites after 1-14 days (0 cancels). Rentals live in `Saves/KidsMode/rentals.txt` as `<expiry epoch>|<rompath>`; a hand-written `<days>|<rompath>` line is also accepted. Only the Favorites entry is removed: the ROM and the child's saves are untouched, so adding the game back to Favorites restores it with its progress.
++
++Notes: the *Play timer* picker on the start screen is no longer used (limits come from the schedule above). Time added with *Add play time* does not extend the play window; use *Unlimited today* for that. The status line in the parent menu now appears in the header ("Parent Menu - N min left").
++
++These changes were developed with AI assistance (Claude). They were checked by running the schedule and rental logic against a simulated clock, but the menu changes were not compiled or tested on hardware by the author of this note; please test on your device first.
++
+ ## Credits
+ 
+ - Original Kids Mode concept and implementation by Reddit user `u/daverad`.
+diff --git a/src/kidsMode/videoui.c b/src/kidsMode/videoui.c
+index 98c066c..03cf386 100644
+--- a/src/kidsMode/videoui.c
++++ b/src/kidsMode/videoui.c
+@@ -16,7 +16,12 @@
+ //   exit 3:  "PIN" \n <4 digits>
+ //   exit 5:  "MENU" \n "UNLOCK"
+ //            "MENU" \n "ADDTIME" \n <minutes>   (inline add-time selector)
+-//            "MENU" \n "NOTIMER"                (turn the play timer off)
++//            "MENU" \n "NOTIMER"                (bypass the daily limits today)
++//            "MENU" \n "SETWEEKDAY" \n <minutes> (daily minutes, Mon-Fri)
++//            "MENU" \n "SETWEEKEND" \n <minutes> (daily minutes, Sat-Sun)
++//            "MENU" \n "SETWDSTART" | "SETWDEND" | "SETWESTART" | "SETWEEND" \n <HHMM>
++//                                               (play window start/end, 24-hour)
++//            "MENU" \n "RENTAL" \n <days>        (rent highlighted game; 0 = cancel)
+ //            "MENU" \n "SWITCHPROFILE" \n Main|Guest
+ //            "TIMER" \n <minutes>               (--pick-timer mode)
+ //            "PROFILE" \n Main|Guest \n <minutes> (--pick-profile mode)
+@@ -34,7 +39,8 @@
+ //                                  carousel (default)
+ //   kidui --set-pin -t "..." [--notice "..."]
+ //                                  PIN entry only (for initial PIN setup)
+-//   kidui --parent-menu --remaining S
++//   kidui --parent-menu --remaining S [--weekday-min M --weekend-min M]
++//                         [--wd-start HHMM --wd-end HHMM --we-start HHMM --we-end HHMM]
+ //                                  post-PIN parent menu (S = seconds left,
+ //                                  -1 = timer off). "Add play time" is an
+ //                                  Onion-style value selector: LEFT/RIGHT
+@@ -120,11 +126,22 @@ typedef enum { SCREEN_CAROUSEL,
+ 
+ #define MENU_SWITCHPROFILE 0
+ #define MENU_ADDTIME 1
+-#define MENU_SAVESTATES 2
+-#define MENU_CAROUSEL_SETTINGS 3
++#define MENU_WEEKDAY 2
++#define MENU_WEEKEND 3
++#define MENU_WD_START 4
++#define MENU_WD_END 5
++#define MENU_WE_START 6
++#define MENU_WE_END 7
++#define MENU_RENTAL 8
++#define MENU_SAVESTATES 9
++#define MENU_CAROUSEL_SETTINGS 10
+ #define CAROUSEL_FLOORS 0
+ #define CAROUSEL_CATEGORIES 1
+-#define MENU_UNLOCK 4
++#define MENU_UNLOCK 11
++#define WINDOW_STEP_MIN 15
++#define WINDOW_VALUES (24 * 60 / WINDOW_STEP_MIN) // 0 = 12:00 am ... 95 = 11:45 pm
++#define RENTAL_MAX_DAYS 14
++#define RENTAL_DEFAULT_DAYS 3
+ #define CATEGORY_MOVIES 0
+ #define CATEGORY_MUSIC 1
+ #define CATEGORY_CARTOONS 2
+@@ -3432,11 +3449,49 @@ static void formatAddMinutes(void *self, char *out_label)
+ {
+     ListItem *item = (ListItem *)self;
+     if (item->value == 0)
+-        sprintf(out_label, "OFF");
++        sprintf(out_label, "Unlimited today");
+     else
+         sprintf(out_label, "+%d min", item->value * TIMER_STEP);
+ }
+ 
++static void formatDailyMinutes(void *self, char *out_label)
++{
++    ListItem *item = (ListItem *)self;
++    sprintf(out_label, "%d min", item->value * TIMER_STEP);
++}
++
++// Time-of-day selector: value counts WINDOW_STEP_MIN steps since midnight
++static void formatWindowTime(void *self, char *out_label)
++{
++    ListItem *item = (ListItem *)self;
++    int minutes = item->value * WINDOW_STEP_MIN;
++    int hour = minutes / 60;
++    int hour12 = hour % 12 == 0 ? 12 : hour % 12;
++    sprintf(out_label, "%d:%02d %s", hour12, minutes % 60,
++            hour < 12 ? "am" : "pm");
++}
++
++static int hhmmToWindowValue(int hhmm)
++{
++    int value = ((hhmm / 100) * 60 + hhmm % 100) / WINDOW_STEP_MIN;
++    if (value < 0)
++        value = 0;
++    if (value > WINDOW_VALUES - 1)
++        value = WINDOW_VALUES - 1;
++    return value;
++}
++
++static void formatRentalDays(void *self, char *out_label)
++{
++    ListItem *item = (ListItem *)self;
++    if (item->value == 0)
++        sprintf(out_label, "Cancel rental");
++    else if (item->value == 1)
++        sprintf(out_label, "1 day");
++    else
++        sprintf(out_label, "%d days", item->value);
++}
++
+ static void onLockFloorToggle(void *self)
+ {
+     ListItem *item = (ListItem *)self;
+@@ -3502,7 +3557,15 @@ static void onCartoonsToggle(void *self)
+ static void renderMenu(List *list, int remaining)
+ {
+     renderBase();
+-    theme_renderHeader(screen, "Kids Mode - Parent Menu", false);
++    // The parent menu has more rows than the old status line could share the
++    // screen with, so the time left moves into the header.
++    char menu_header[STR_MAX];
++    if (remaining >= 0)
++        snprintf(menu_header, sizeof(menu_header), "Parent Menu - %d min left",
++                 (remaining + 59) / 60);
++    else
++        snprintf(menu_header, sizeof(menu_header), "Kids Mode - Parent Menu");
++    theme_renderHeader(screen, menu_header, false);
+     theme_renderHeaderBattery(screen, batteryPercentage());
+     theme_renderList(screen, list);
+ 
+@@ -3532,9 +3595,10 @@ static void renderMenu(List *list, int remaining)
+         else
+             snprintf(info, sizeof(info), "No timer set");
+     }
+-    drawTextAlign(info, (int)(620.0 * g_scale), (int)(395.0 * g_scale),
+-                  resource_getFont(LIST), theme()->list.color,
+-                  g_display.width - 40, TEXT_RIGHT);
++    if (list->item_count <= 5)
++        drawTextAlign(info, (int)(620.0 * g_scale), (int)(395.0 * g_scale),
++                      resource_getFont(LIST), theme()->list.color,
++                      g_display.width - 40, TEXT_RIGHT);
+ 
+     theme_renderFooter(screen);
+     theme_renderStandardHint(screen, "OK", "BACK");
+@@ -3837,6 +3901,9 @@ int main(int argc, char *argv[])
+     int menu_remaining = -1;
+     int menu_lock_floor = 0;
+     int menu_allow_save_states = 0;
++    int menu_weekday_min = 30;
++    int menu_weekend_min = 60;
++    int menu_window_hhmm[4] = {1600, 1900, 800, 1900};
+     char menu_switch_profile[16] = "";
+     char current_profile[16] = "Main";
+     int main_profile_available = 1;
+@@ -3873,6 +3940,18 @@ int main(int argc, char *argv[])
+             menu_lock_floor = atoi(argv[++i]);
+         else if (strcmp(argv[i], "--allow-save-states") == 0 && i + 1 < argc)
+             menu_allow_save_states = atoi(argv[++i]) != 0;
++        else if (strcmp(argv[i], "--weekday-min") == 0 && i + 1 < argc)
++            menu_weekday_min = atoi(argv[++i]);
++        else if (strcmp(argv[i], "--weekend-min") == 0 && i + 1 < argc)
++            menu_weekend_min = atoi(argv[++i]);
++        else if (strcmp(argv[i], "--wd-start") == 0 && i + 1 < argc)
++            menu_window_hhmm[0] = atoi(argv[++i]);
++        else if (strcmp(argv[i], "--wd-end") == 0 && i + 1 < argc)
++            menu_window_hhmm[1] = atoi(argv[++i]);
++        else if (strcmp(argv[i], "--we-start") == 0 && i + 1 < argc)
++            menu_window_hhmm[2] = atoi(argv[++i]);
++        else if (strcmp(argv[i], "--we-end") == 0 && i + 1 < argc)
++            menu_window_hhmm[3] = atoi(argv[++i]);
+         else if (strcmp(argv[i], "--switch-profile") == 0 && i + 1 < argc)
+             strncpy(menu_switch_profile, argv[++i],
+                     sizeof(menu_switch_profile) - 1);
+@@ -3912,6 +3991,17 @@ int main(int argc, char *argv[])
+         menu_timer_minutes = 0;
+     if (menu_timer_minutes > TIMER_MAX)
+         menu_timer_minutes = TIMER_MAX;
++    // Daily-minutes rows count in TIMER_STEP units (5..120 min)
++    int weekday_value = (menu_weekday_min + TIMER_STEP / 2) / TIMER_STEP;
++    int weekend_value = (menu_weekend_min + TIMER_STEP / 2) / TIMER_STEP;
++    if (weekday_value < 1)
++        weekday_value = 1;
++    if (weekday_value > TIMER_MAX / TIMER_STEP)
++        weekday_value = TIMER_MAX / TIMER_STEP;
++    if (weekend_value < 1)
++        weekend_value = 1;
++    if (weekend_value > TIMER_MAX / TIMER_STEP)
++        weekend_value = TIMER_MAX / TIMER_STEP;
+ 
+     signal(SIGINT, sigHandler);
+     signal(SIGTERM, sigHandler);
+@@ -3934,7 +4024,7 @@ int main(int argc, char *argv[])
+     int remaining = -1;
+ 
+     // Parent menu list (native Onion list component)
+-    List menu_list = list_create(5, LIST_SMALL);
++    List menu_list = list_create(12, LIST_SMALL);
+     if (strcmp(menu_switch_profile, "Main") == 0)
+         list_addItem(&menu_list,
+                      (ListItem){.label = "Switch to Main profile",
+@@ -3954,6 +4044,38 @@ int main(int argc, char *argv[])
+                                         .value_max = TIMER_MAX / TIMER_STEP,
+                                         .value = 1,
+                                         .value_formatter = formatAddMinutes});
++    list_addItem(&menu_list, (ListItem){.label = "Weekday daily limit",
++                                        .item_type = MULTIVALUE,
++                                        .value_min = 1,
++                                        .value_max = TIMER_MAX / TIMER_STEP,
++                                        .value = weekday_value,
++                                        .value_formatter = formatDailyMinutes});
++    list_addItem(&menu_list, (ListItem){.label = "Weekend daily limit",
++                                        .item_type = MULTIVALUE,
++                                        .value_min = 1,
++                                        .value_max = TIMER_MAX / TIMER_STEP,
++                                        .value = weekend_value,
++                                        .value_formatter = formatDailyMinutes});
++    static const char *window_labels[4] = {
++        "Weekday play from", "Weekday play until", "Weekend play from",
++        "Weekend play until"};
++    for (int w = 0; w < 4; w++)
++        list_addItem(&menu_list,
++                     (ListItem){.item_type = MULTIVALUE,
++                                .value_min = 0,
++                                .value_max = WINDOW_VALUES - 1,
++                                .value = hhmmToWindowValue(menu_window_hhmm[w]),
++                                .value_formatter = formatWindowTime});
++    for (int w = 0; w < 4; w++)
++        snprintf(menu_list.items[MENU_WD_START + w].label,
++                 sizeof(menu_list.items[MENU_WD_START + w].label), "%s",
++                 window_labels[w]);
++    list_addItem(&menu_list, (ListItem){.label = "Rent current game",
++                                        .item_type = MULTIVALUE,
++                                        .value_min = 0,
++                                        .value_max = RENTAL_MAX_DAYS,
++                                        .value = RENTAL_DEFAULT_DAYS,
++                                        .value_formatter = formatRentalDays});
+     list_addItem(&menu_list,
+                  (ListItem){.label = "Save/load states",
+                             .item_type = TOGGLE,
+@@ -4155,7 +4277,12 @@ int main(int argc, char *argv[])
+              (active_screen == SCREEN_PICKPROFILE &&
+               profile_list.active_pos == 1) ||
+              (active_screen == SCREEN_MENU &&
+-              menu_list.active_pos == MENU_ADDTIME));
++              (menu_list.active_pos == MENU_ADDTIME ||
++               menu_list.active_pos == MENU_WEEKDAY ||
++               menu_list.active_pos == MENU_WEEKEND ||
++               (menu_list.active_pos >= MENU_WD_START &&
++                menu_list.active_pos <= MENU_WE_END) ||
++               menu_list.active_pos == MENU_RENTAL)));
+         bool carousel_repeat_context = active_screen == SCREEN_CAROUSEL;
+         bool timer_value_repeat =
+             key_changed && keystate[changed_key] == REPEATING &&
+@@ -4388,6 +4515,46 @@ int main(int argc, char *argv[])
+                         exit_code = 5;
+                         quit = true;
+                     }
++                    else if (menu_list.active_pos == MENU_WEEKDAY ||
++                             menu_list.active_pos == MENU_WEEKEND) {
++                        char limit_str[16];
++                        snprintf(limit_str, sizeof(limit_str), "%d",
++                                 menu_list.items[menu_list.active_pos].value *
++                                     TIMER_STEP);
++                        writeResult("MENU",
++                                    menu_list.active_pos == MENU_WEEKDAY
++                                        ? "SETWEEKDAY"
++                                        : "SETWEEKEND",
++                                    limit_str);
++                        exit_code = 5;
++                        quit = true;
++                    }
++                    else if (menu_list.active_pos >= MENU_WD_START &&
++                             menu_list.active_pos <= MENU_WE_END) {
++                        static const char *window_actions[4] = {
++                            "SETWDSTART", "SETWDEND", "SETWESTART",
++                            "SETWEEND"};
++                        int minutes =
++                            menu_list.items[menu_list.active_pos].value *
++                            WINDOW_STEP_MIN;
++                        char hhmm_str[16];
++                        snprintf(hhmm_str, sizeof(hhmm_str), "%02d%02d",
++                                 minutes / 60, minutes % 60);
++                        writeResult("MENU",
++                                    window_actions[menu_list.active_pos -
++                                                   MENU_WD_START],
++                                    hhmm_str);
++                        exit_code = 5;
++                        quit = true;
++                    }
++                    else if (menu_list.active_pos == MENU_RENTAL) {
++                        char days_str[16];
++                        snprintf(days_str, sizeof(days_str), "%d",
++                                 menu_list.items[MENU_RENTAL].value);
++                        writeResult("MENU", "RENTAL", days_str);
++                        exit_code = 5;
++                        quit = true;
++                    }
+                     else if (menu_list.active_pos == MENU_SAVESTATES) {
+                         list_activateItem(&menu_list);
+                         dirty = true;
