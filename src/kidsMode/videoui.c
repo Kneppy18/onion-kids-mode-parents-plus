@@ -16,7 +16,12 @@
 //   exit 3:  "PIN" \n <4 digits>
 //   exit 5:  "MENU" \n "UNLOCK"
 //            "MENU" \n "ADDTIME" \n <minutes>   (inline add-time selector)
-//            "MENU" \n "NOTIMER"                (turn the play timer off)
+//            "MENU" \n "NOTIMER"                (bypass the daily limits today)
+//            "MENU" \n "SETWEEKDAY" \n <minutes> (daily minutes, Mon-Fri)
+//            "MENU" \n "SETWEEKEND" \n <minutes> (daily minutes, Sat-Sun)
+//            "MENU" \n "SETWDSTART" | "SETWDEND" | "SETWESTART" | "SETWEEND" \n <HHMM>
+//                                               (play window start/end, 24-hour)
+//            "MENU" \n "RENTAL" \n <days>        (rent highlighted game; 0 = cancel)
 //            "MENU" \n "SWITCHPROFILE" \n Main|Guest
 //            "TIMER" \n <minutes>               (--pick-timer mode)
 //            "PROFILE" \n Main|Guest \n <minutes> (--pick-profile mode)
@@ -34,7 +39,8 @@
 //                                  carousel (default)
 //   kidui --set-pin -t "..." [--notice "..."]
 //                                  PIN entry only (for initial PIN setup)
-//   kidui --parent-menu --remaining S
+//   kidui --parent-menu --remaining S [--weekday-min M --weekend-min M]
+//                         [--wd-start HHMM --wd-end HHMM --we-start HHMM --we-end HHMM]
 //                                  post-PIN parent menu (S = seconds left,
 //                                  -1 = timer off). "Add play time" is an
 //                                  Onion-style value selector: LEFT/RIGHT
@@ -120,11 +126,22 @@ typedef enum { SCREEN_CAROUSEL,
 
 #define MENU_SWITCHPROFILE 0
 #define MENU_ADDTIME 1
-#define MENU_SAVESTATES 2
-#define MENU_CAROUSEL_SETTINGS 3
+#define MENU_WEEKDAY 2
+#define MENU_WEEKEND 3
+#define MENU_WD_START 4
+#define MENU_WD_END 5
+#define MENU_WE_START 6
+#define MENU_WE_END 7
+#define MENU_RENTAL 8
+#define MENU_SAVESTATES 9
+#define MENU_CAROUSEL_SETTINGS 10
 #define CAROUSEL_FLOORS 0
 #define CAROUSEL_CATEGORIES 1
-#define MENU_UNLOCK 4
+#define MENU_UNLOCK 11
+#define WINDOW_STEP_MIN 15
+#define WINDOW_VALUES (24 * 60 / WINDOW_STEP_MIN) // 0 = 12:00 am ... 95 = 11:45 pm
+#define RENTAL_MAX_DAYS 14
+#define RENTAL_DEFAULT_DAYS 3
 #define CATEGORY_MOVIES 0
 #define CATEGORY_MUSIC 1
 #define CATEGORY_CARTOONS 2
@@ -3432,9 +3449,47 @@ static void formatAddMinutes(void *self, char *out_label)
 {
     ListItem *item = (ListItem *)self;
     if (item->value == 0)
-        sprintf(out_label, "OFF");
+        sprintf(out_label, "Unlimited today");
     else
         sprintf(out_label, "+%d min", item->value * TIMER_STEP);
+}
+
+static void formatDailyMinutes(void *self, char *out_label)
+{
+    ListItem *item = (ListItem *)self;
+    sprintf(out_label, "%d min", item->value * TIMER_STEP);
+}
+
+// Time-of-day selector: value counts WINDOW_STEP_MIN steps since midnight
+static void formatWindowTime(void *self, char *out_label)
+{
+    ListItem *item = (ListItem *)self;
+    int minutes = item->value * WINDOW_STEP_MIN;
+    int hour = minutes / 60;
+    int hour12 = hour % 12 == 0 ? 12 : hour % 12;
+    sprintf(out_label, "%d:%02d %s", hour12, minutes % 60,
+            hour < 12 ? "am" : "pm");
+}
+
+static int hhmmToWindowValue(int hhmm)
+{
+    int value = ((hhmm / 100) * 60 + hhmm % 100) / WINDOW_STEP_MIN;
+    if (value < 0)
+        value = 0;
+    if (value > WINDOW_VALUES - 1)
+        value = WINDOW_VALUES - 1;
+    return value;
+}
+
+static void formatRentalDays(void *self, char *out_label)
+{
+    ListItem *item = (ListItem *)self;
+    if (item->value == 0)
+        sprintf(out_label, "Cancel rental");
+    else if (item->value == 1)
+        sprintf(out_label, "1 day");
+    else
+        sprintf(out_label, "%d days", item->value);
 }
 
 static void onLockFloorToggle(void *self)
@@ -3502,7 +3557,15 @@ static void onCartoonsToggle(void *self)
 static void renderMenu(List *list, int remaining)
 {
     renderBase();
-    theme_renderHeader(screen, "Kids Mode - Parent Menu", false);
+    // The parent menu has more rows than the old status line could share the
+    // screen with, so the time left moves into the header.
+    char menu_header[STR_MAX];
+    if (remaining >= 0)
+        snprintf(menu_header, sizeof(menu_header), "Parent Menu - %d min left",
+                 (remaining + 59) / 60);
+    else
+        snprintf(menu_header, sizeof(menu_header), "Kids Mode - Parent Menu");
+    theme_renderHeader(screen, menu_header, false);
     theme_renderHeaderBattery(screen, batteryPercentage());
     theme_renderList(screen, list);
 
@@ -3532,9 +3595,10 @@ static void renderMenu(List *list, int remaining)
         else
             snprintf(info, sizeof(info), "No timer set");
     }
-    drawTextAlign(info, (int)(620.0 * g_scale), (int)(395.0 * g_scale),
-                  resource_getFont(LIST), theme()->list.color,
-                  g_display.width - 40, TEXT_RIGHT);
+    if (list->item_count <= 5)
+        drawTextAlign(info, (int)(620.0 * g_scale), (int)(395.0 * g_scale),
+                      resource_getFont(LIST), theme()->list.color,
+                      g_display.width - 40, TEXT_RIGHT);
 
     theme_renderFooter(screen);
     theme_renderStandardHint(screen, "OK", "BACK");
@@ -3837,6 +3901,9 @@ int main(int argc, char *argv[])
     int menu_remaining = -1;
     int menu_lock_floor = 0;
     int menu_allow_save_states = 0;
+    int menu_weekday_min = 30;
+    int menu_weekend_min = 60;
+    int menu_window_hhmm[4] = {1600, 1900, 800, 1900};
     char menu_switch_profile[16] = "";
     char current_profile[16] = "Main";
     int main_profile_available = 1;
@@ -3873,6 +3940,18 @@ int main(int argc, char *argv[])
             menu_lock_floor = atoi(argv[++i]);
         else if (strcmp(argv[i], "--allow-save-states") == 0 && i + 1 < argc)
             menu_allow_save_states = atoi(argv[++i]) != 0;
+        else if (strcmp(argv[i], "--weekday-min") == 0 && i + 1 < argc)
+            menu_weekday_min = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--weekend-min") == 0 && i + 1 < argc)
+            menu_weekend_min = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--wd-start") == 0 && i + 1 < argc)
+            menu_window_hhmm[0] = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--wd-end") == 0 && i + 1 < argc)
+            menu_window_hhmm[1] = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--we-start") == 0 && i + 1 < argc)
+            menu_window_hhmm[2] = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--we-end") == 0 && i + 1 < argc)
+            menu_window_hhmm[3] = atoi(argv[++i]);
         else if (strcmp(argv[i], "--switch-profile") == 0 && i + 1 < argc)
             strncpy(menu_switch_profile, argv[++i],
                     sizeof(menu_switch_profile) - 1);
@@ -3912,6 +3991,17 @@ int main(int argc, char *argv[])
         menu_timer_minutes = 0;
     if (menu_timer_minutes > TIMER_MAX)
         menu_timer_minutes = TIMER_MAX;
+    // Daily-minutes rows count in TIMER_STEP units (5..120 min)
+    int weekday_value = (menu_weekday_min + TIMER_STEP / 2) / TIMER_STEP;
+    int weekend_value = (menu_weekend_min + TIMER_STEP / 2) / TIMER_STEP;
+    if (weekday_value < 1)
+        weekday_value = 1;
+    if (weekday_value > TIMER_MAX / TIMER_STEP)
+        weekday_value = TIMER_MAX / TIMER_STEP;
+    if (weekend_value < 1)
+        weekend_value = 1;
+    if (weekend_value > TIMER_MAX / TIMER_STEP)
+        weekend_value = TIMER_MAX / TIMER_STEP;
 
     signal(SIGINT, sigHandler);
     signal(SIGTERM, sigHandler);
@@ -3934,7 +4024,7 @@ int main(int argc, char *argv[])
     int remaining = -1;
 
     // Parent menu list (native Onion list component)
-    List menu_list = list_create(5, LIST_SMALL);
+    List menu_list = list_create(12, LIST_SMALL);
     if (strcmp(menu_switch_profile, "Main") == 0)
         list_addItem(&menu_list,
                      (ListItem){.label = "Switch to Main profile",
@@ -3954,6 +4044,38 @@ int main(int argc, char *argv[])
                                         .value_max = TIMER_MAX / TIMER_STEP,
                                         .value = 1,
                                         .value_formatter = formatAddMinutes});
+    list_addItem(&menu_list, (ListItem){.label = "Weekday daily limit",
+                                        .item_type = MULTIVALUE,
+                                        .value_min = 1,
+                                        .value_max = TIMER_MAX / TIMER_STEP,
+                                        .value = weekday_value,
+                                        .value_formatter = formatDailyMinutes});
+    list_addItem(&menu_list, (ListItem){.label = "Weekend daily limit",
+                                        .item_type = MULTIVALUE,
+                                        .value_min = 1,
+                                        .value_max = TIMER_MAX / TIMER_STEP,
+                                        .value = weekend_value,
+                                        .value_formatter = formatDailyMinutes});
+    static const char *window_labels[4] = {
+        "Weekday play from", "Weekday play until", "Weekend play from",
+        "Weekend play until"};
+    for (int w = 0; w < 4; w++)
+        list_addItem(&menu_list,
+                     (ListItem){.item_type = MULTIVALUE,
+                                .value_min = 0,
+                                .value_max = WINDOW_VALUES - 1,
+                                .value = hhmmToWindowValue(menu_window_hhmm[w]),
+                                .value_formatter = formatWindowTime});
+    for (int w = 0; w < 4; w++)
+        snprintf(menu_list.items[MENU_WD_START + w].label,
+                 sizeof(menu_list.items[MENU_WD_START + w].label), "%s",
+                 window_labels[w]);
+    list_addItem(&menu_list, (ListItem){.label = "Rent current game",
+                                        .item_type = MULTIVALUE,
+                                        .value_min = 0,
+                                        .value_max = RENTAL_MAX_DAYS,
+                                        .value = RENTAL_DEFAULT_DAYS,
+                                        .value_formatter = formatRentalDays});
     list_addItem(&menu_list,
                  (ListItem){.label = "Save/load states",
                             .item_type = TOGGLE,
@@ -4155,7 +4277,12 @@ int main(int argc, char *argv[])
              (active_screen == SCREEN_PICKPROFILE &&
               profile_list.active_pos == 1) ||
              (active_screen == SCREEN_MENU &&
-              menu_list.active_pos == MENU_ADDTIME));
+              (menu_list.active_pos == MENU_ADDTIME ||
+               menu_list.active_pos == MENU_WEEKDAY ||
+               menu_list.active_pos == MENU_WEEKEND ||
+               (menu_list.active_pos >= MENU_WD_START &&
+                menu_list.active_pos <= MENU_WE_END) ||
+               menu_list.active_pos == MENU_RENTAL)));
         bool carousel_repeat_context = active_screen == SCREEN_CAROUSEL;
         bool timer_value_repeat =
             key_changed && keystate[changed_key] == REPEATING &&
@@ -4385,6 +4512,46 @@ int main(int argc, char *argv[])
                                      add_minutes);
                             writeResult("MENU", "ADDTIME", minutes_str);
                         }
+                        exit_code = 5;
+                        quit = true;
+                    }
+                    else if (menu_list.active_pos == MENU_WEEKDAY ||
+                             menu_list.active_pos == MENU_WEEKEND) {
+                        char limit_str[16];
+                        snprintf(limit_str, sizeof(limit_str), "%d",
+                                 menu_list.items[menu_list.active_pos].value *
+                                     TIMER_STEP);
+                        writeResult("MENU",
+                                    menu_list.active_pos == MENU_WEEKDAY
+                                        ? "SETWEEKDAY"
+                                        : "SETWEEKEND",
+                                    limit_str);
+                        exit_code = 5;
+                        quit = true;
+                    }
+                    else if (menu_list.active_pos >= MENU_WD_START &&
+                             menu_list.active_pos <= MENU_WE_END) {
+                        static const char *window_actions[4] = {
+                            "SETWDSTART", "SETWDEND", "SETWESTART",
+                            "SETWEEND"};
+                        int minutes =
+                            menu_list.items[menu_list.active_pos].value *
+                            WINDOW_STEP_MIN;
+                        char hhmm_str[16];
+                        snprintf(hhmm_str, sizeof(hhmm_str), "%02d%02d",
+                                 minutes / 60, minutes % 60);
+                        writeResult("MENU",
+                                    window_actions[menu_list.active_pos -
+                                                   MENU_WD_START],
+                                    hhmm_str);
+                        exit_code = 5;
+                        quit = true;
+                    }
+                    else if (menu_list.active_pos == MENU_RENTAL) {
+                        char days_str[16];
+                        snprintf(days_str, sizeof(days_str), "%d",
+                                 menu_list.items[MENU_RENTAL].value);
+                        writeResult("MENU", "RENTAL", days_str);
                         exit_code = 5;
                         quit = true;
                     }
